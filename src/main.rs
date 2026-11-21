@@ -287,15 +287,22 @@ fn collect_earliest<'a, K: Eq + Hash>(
     }
 }
 
-fn read_events<'a>(
+type PackedEvent<'a> = (u64, i64, Option<Event<'a>>);
+
+struct EventShards<'a> {
+    packed: [Mutex<Vec<PackedEvent<'a>>>; EVENT_BUCKETS],
+    other: [Mutex<Vec<StagedEvent<'a>>>; EVENT_BUCKETS],
+}
+
+fn stage_events<'a>(
     files: &'a [memmap2::Mmap],
-    people: &People<'a>,
     catalog: &Catalog,
     window: &Window,
-) -> Vec<Vec<Event<'a>>> {
-    let t0 = Instant::now();
-    let inline: [_; EVENT_BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
-    let shared: [_; EVENT_BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
+) -> EventShards<'a> {
+    let stages = EventShards {
+        packed: std::array::from_fn(|_| Mutex::new(Vec::new())),
+        other: std::array::from_fn(|_| Mutex::new(Vec::new())),
+    };
     chunks(files).into_par_iter().for_each(|chunk| {
         let mut packed = buckets();
         let mut local = buckets();
@@ -312,15 +319,17 @@ fn read_events<'a>(
                 local[shard(event.id)].push(event);
             }
         }
-        publish(packed, &inline);
-        publish(local, &shared);
+        publish(packed, &stages.packed);
+        publish(local, &stages.other);
     });
-    let t_parse = t0.elapsed();
+    stages
+}
 
+fn resolve_events<'a>(stages: EventShards<'a>, people: &People<'a>) -> Vec<Vec<Event<'a>>> {
     let people_buckets: [_; BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
-    inline
+    stages.packed
         .into_par_iter()
-        .zip(shared)
+        .zip(stages.other)
         .for_each(|(packed, bucket)| {
             let packed = packed.into_inner().unwrap();
             let bucket = bucket.into_inner().unwrap();
@@ -333,8 +342,6 @@ fn read_events<'a>(
             collect_earliest(other, other_count, people, &mut local);
             publish(local, &people_buckets);
         });
-    let t_dedup = t0.elapsed() - t_parse;
-    eprintln!("events breakdown: parse={:.3}s dedup={:.3}s", t_parse.as_secs_f64(), t_dedup.as_secs_f64());
     people_buckets
         .into_iter()
         .map(|part| part.into_inner().unwrap())
@@ -601,17 +608,21 @@ fn run(data: &Path, out: &Path) {
     let products = fs::read(data.join("products.csv")).unwrap();
     let campaigns = fs::read(data.join("campaigns.csv")).unwrap();
     let catalog = Catalog::new(&products, &campaigns);
-    let t_meta = start.elapsed();
     let links = maps(&data.join("links"));
-    let people = People::from_links(&links);
-    let t_links = start.elapsed();
     let event_files = maps(&data.join("events"));
     let click_files = maps(&data.join("clicks"));
     let t_maps = start.elapsed();
-    let events = read_events(&event_files, &people, &catalog, &window);
-    let t_events = start.elapsed();
-    let clicks = read_clicks(&click_files, &people, &catalog, &window);
-    let t_clicks = start.elapsed();
+    // Event-ID deduplication does not depend on the canonical user names.
+    let (people, staged) = rayon::join(
+        || People::from_links(&links),
+        || stage_events(&event_files, &catalog, &window),
+    );
+    let t_staged = start.elapsed();
+    let (events, clicks) = rayon::join(
+        || resolve_events(staged, &people),
+        || read_clicks(&click_files, &people, &catalog, &window),
+    );
+    let t_resolved = start.elapsed();
 
     let user_out = out.join("user_daily");
     let campaign_out = out.join("campaign_daily");
@@ -636,13 +647,11 @@ fn run(data: &Path, out: &Path) {
     );
     let t_total = start.elapsed();
     eprintln!(
-        "TIMING: meta={:.3}s links={:.3}s mmaps={:.3}s events={:.3}s clicks={:.3}s output={:.3}s TOTAL={:.3}s",
-        t_meta.as_secs_f64(),
-        (t_links - t_meta).as_secs_f64(),
-        (t_maps - t_links).as_secs_f64(),
-        (t_events - t_maps).as_secs_f64(),
-        (t_clicks - t_events).as_secs_f64(),
-        (t_total - t_clicks).as_secs_f64(),
+        "TIMING: setup={:.3}s links_and_event_parse={:.3}s event_dedup_and_clicks={:.3}s output={:.3}s TOTAL={:.3}s",
+        t_maps.as_secs_f64(),
+        (t_staged - t_maps).as_secs_f64(),
+        (t_resolved - t_staged).as_secs_f64(),
+        (t_total - t_resolved).as_secs_f64(),
         t_total.as_secs_f64()
     );
 }
