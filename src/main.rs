@@ -24,18 +24,46 @@ fn shard(key: &[u8]) -> usize {
 
 type Name<'a> = &'a [u8];
 
+#[derive(Default)]
+struct UserMap<'a, T> {
+    compact: FxHashMap<u64, T>,
+    other: FxHashMap<Name<'a>, T>,
+}
+
+impl<'a, T> UserMap<'a, T> {
+    #[inline]
+    fn key(name: Name<'_>) -> Option<u64> {
+        let [b'u', suffix @ ..] = name else {
+            return None;
+        };
+        Some(u64::from_le_bytes(suffix.try_into().ok()?))
+    }
+
+    #[inline]
+    fn get(&self, name: Name<'a>) -> Option<&T> {
+        match Self::key(name) {
+            Some(key) => self.compact.get(&key),
+            None => self.other.get(name),
+        }
+    }
+
+    #[inline]
+    fn get_or_insert(&mut self, name: Name<'a>, value: impl FnOnce() -> T) -> &T {
+        match Self::key(name) {
+            Some(key) => self.compact.entry(key).or_insert_with(value),
+            None => self.other.entry(name).or_insert_with(value),
+        }
+    }
+}
+
 struct People<'a> {
-    names: FxHashMap<Name<'a>, Name<'a>>,
+    names: UserMap<'a, Name<'a>>,
 }
 
 impl<'a> People<'a> {
     #[inline]
     fn name(&self, name: Name<'a>) -> Name<'a> {
-        if self.names.is_empty() {
-            name
-        } else {
-            self.names.get(name).copied().unwrap_or(name)
-        }
+        self.names.get(name).copied().unwrap_or(name)
     }
 
     fn from_links(files: &'a [memmap2::Mmap]) -> Self {
@@ -80,13 +108,14 @@ impl<'a> People<'a> {
             sizes[a] += sizes[b];
             labels[a] = labels[a].min(labels[b]);
         }
-        let names = ids
-            .into_iter()
-            .filter_map(|(id, node)| {
-                let name = labels[root(&mut parent, node) as usize];
-                (id != name).then_some((id, name))
-            })
-            .collect();
+        let mut names = UserMap::default();
+        names.compact.reserve(ids.len() / 2);
+        for (id, node) in ids {
+            let name = labels[root(&mut parent, node) as usize];
+            if id != name {
+                names.get_or_insert(id, || name);
+            }
+        }
         Self { names }
     }
 }
@@ -452,6 +481,60 @@ pub struct UserRow<'a> {
 
 type CampaignDays = FxHashMap<(u32, i32), CampaignRow>;
 
+enum CampaignCounts {
+    Dense {
+        first_day: i32,
+        day_count: usize,
+        rows: Vec<CampaignRow>,
+    },
+    Sparse(CampaignDays),
+}
+
+impl CampaignCounts {
+    fn new(window: &Window, campaigns: usize) -> Self {
+        let first_day = window.start.div_euclid(DAY);
+        let last_day = window.end.saturating_sub(1).div_euclid(DAY);
+        let days = usize::try_from(last_day - first_day + 1).unwrap_or(0);
+        if i32::try_from(first_day).is_ok()
+            && i32::try_from(last_day).is_ok()
+            && let Some(count) = days.checked_mul(campaigns)
+            && (1..=262_144).contains(&count)
+        {
+            return Self::Dense {
+                first_day: first_day as i32,
+                day_count: days,
+                rows: std::iter::repeat_with(CampaignRow::default).take(count).collect(),
+            };
+        }
+        Self::Sparse(CampaignDays::default())
+    }
+
+    #[inline]
+    fn entry(&mut self, campaign: u32, day: i32) -> &mut CampaignRow {
+        match self {
+            Self::Dense { first_day, day_count, rows } => {
+                let day_offset = (i64::from(day) - i64::from(*first_day)) as usize;
+                &mut rows[campaign as usize * *day_count + day_offset]
+            }
+            Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
+        }
+    }
+
+    fn finish(self) -> CampaignDays {
+        match self {
+            Self::Dense { first_day, day_count, rows } => rows
+                .into_iter()
+                .enumerate()
+                .filter(|(_, row)| row.sessions != 0 || row.assisted != 0)
+                .map(|(index, row)| {
+                    (((index / day_count) as u32, first_day + (index % day_count) as i32), row)
+                })
+                .collect(),
+            Self::Sparse(rows) => rows,
+        }
+    }
+}
+
 #[derive(Default)]
 struct UserDay {
     sessions: i64,
@@ -540,13 +623,14 @@ fn aggregate<'a>(
     events: Vec<Event<'a>>,
     clicks: Vec<Click<'a>>,
     catalog: &Catalog<'a>,
+    window: &Window,
 ) -> (Vec<UserRow<'a>>, CampaignDays) {
-    let mut ids = FxHashMap::default();
+    let mut ids = UserMap::default();
     let mut names = Vec::new();
     let mut events: Vec<_> = events
         .into_iter()
         .map(|event| {
-            let user = *ids.entry(event.user).or_insert_with(|| {
+            let user = *ids.get_or_insert(event.user, || {
                 let id = names.len() as u32;
                 names.push(event.user);
                 id
@@ -580,7 +664,7 @@ fn aggregate<'a>(
             .then_with(|| b.id.cmp(a.id))
     });
 
-    let mut campaign_days = CampaignDays::default();
+    let mut campaign_days = CampaignCounts::new(window, catalog.campaigns.len());
     let mut user_days = Vec::new();
     let mut assists = Assists::new(catalog.campaigns.len());
     let mut totals = UserDay::default();
@@ -629,18 +713,18 @@ fn aggregate<'a>(
             } else {
                 0
             };
-            let credited = campaign_days.entry((winner, day)).or_default();
+            let credited = campaign_days.entry(winner, day);
             credited.sessions += 1;
             credited.purchasing += i64::from(revenue > 0);
             credited.revenue += revenue;
             for campaign in &assists.active {
-                campaign_days.entry((*campaign, day)).or_default().assisted += 1;
+                campaign_days.entry(*campaign, day).assisted += 1;
             }
         }
         user_days.push(totals.take(user, day, &catalog.categories));
         assists.clear();
     }
-    (user_days, campaign_days)
+    (user_days, campaign_days.finish())
 }
 
 fn merge_campaigns(mut result: CampaignDays, other: CampaignDays) -> CampaignDays {
@@ -696,7 +780,7 @@ fn run(data: &Path, out: &Path) {
         .zip(clicks)
         .enumerate()
         .map(|(part, (events, clicks))| {
-            let (users, totals) = aggregate(events, clicks, &catalog);
+            let (users, totals) = aggregate(events, clicks, &catalog, &window);
             if part == 0 || !users.is_empty() {
                 output::users(&user_out.join(format!("part-{part:03}.parquet")), &users);
             }
