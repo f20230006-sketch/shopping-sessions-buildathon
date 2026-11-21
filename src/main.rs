@@ -234,20 +234,37 @@ fn collect_earliest_packed<'a>(
     if entries.is_empty() {
         return;
     }
-    entries.sort_unstable_by_key(|e| (e.0, e.1));
-    let mut last_key = entries[0].0;
-    if let Some(mut event) = entries[0].2 {
+    // Store row indexes so the full rows can stay in a compact sequential
+    // array. Even the maximum dataset fits well below a u32 index per shard.
+    let capacity = (entries.len() * 2).next_power_of_two();
+    let mut slots = vec![0_u32; capacity];
+    let shift = u64::BITS - capacity.trailing_zeros();
+    for index in 0..entries.len() {
+        let (key, ingest, _) = entries[index];
+        let hash = key.rotate_left(23).wrapping_mul(0xd6e8_feb8_6659_fd93);
+        let mut slot = (hash >> shift) as usize;
+        loop {
+            let previous = slots[slot];
+            if previous == 0 {
+                slots[slot] = (index + 1) as u32;
+                break;
+            }
+            let previous = previous as usize - 1;
+            if entries[previous].0 == key {
+                if ingest < entries[previous].1 {
+                    entries[previous].2 = None;
+                    slots[slot] = (index + 1) as u32;
+                } else {
+                    entries[index].2 = None;
+                }
+                break;
+            }
+            slot = (slot + 1) & (capacity - 1);
+        }
+    }
+    for mut event in entries.into_iter().filter_map(|(_, _, event)| event) {
         event.user = people_resolver.name(event.user);
         people[shard(event.user)].push(event);
-    }
-    for entry in &entries[1..] {
-        if entry.0 != last_key {
-            last_key = entry.0;
-            if let Some(mut event) = entry.2 {
-                event.user = people_resolver.name(event.user);
-                people[shard(event.user)].push(event);
-            }
-        }
     }
 }
 

@@ -50,70 +50,86 @@ pub fn lines(chunk: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let mut result = [b"".as_slice(); N];
-    let mut commas = memchr_iter(b',', line);
-    let mut start = 0;
-    let mut quotes = memchr_iter(b'"', line).count();
-    if quotes == 0 {
-        for field in &mut result[..N - 1] {
-            let end = commas.next()?;
-            *field = &line[start..end];
-            start = end + 1;
-        }
-        if commas.next().is_some() {
+    #[cfg(target_arch = "x86_64")]
+    if (32..=128).contains(&line.len()) && std::is_x86_feature_detected!("avx2") {
+        // The scanner loads only within this bounded line.
+        let (mut commas, quotes) = unsafe { separator_masks(line) };
+        if commas.count_ones() as usize != N - 1 {
             return None;
         }
-        result[N - 1] = &line[start..];
-        return Some(result);
+        let mut start = 0;
+        let mut endpoints = 0;
+        let mut result = [b"".as_slice(); N];
+        for field in &mut result[..N - 1] {
+            let end = commas.trailing_zeros() as usize;
+            commas &= commas - 1;
+            *field = strip_ends(&line[start..end], &mut endpoints);
+            start = end + 1;
+        }
+        result[N - 1] = strip_ends(&line[start..], &mut endpoints);
+        return (endpoints == quotes).then_some(result);
     }
-    if quotes % 2 != 0 {
-        return None;
-    }
+
+    let mut commas = memchr_iter(b',', line);
+    let mut result = [b"".as_slice(); N];
+    let mut start = 0;
+    let mut endpoints = 0;
     for field in &mut result[..N - 1] {
         let end = commas.next()?;
-        let raw = &line[start..end];
+        *field = strip_ends(&line[start..end], &mut endpoints);
         start = end + 1;
-        if quotes == 0 {
-            *field = raw;
-        } else if raw.first() == Some(&b'"') {
-            if raw.len() < 2 || raw.last() != Some(&b'"') {
-                return None;
-            }
-            let inner = &raw[1..raw.len() - 1];
-            if memchr(b'"', inner).is_some() {
-                return None;
-            }
-            quotes -= 2;
-            *field = inner;
-        } else {
-            if memchr(b'"', raw).is_some() {
-                return None;
-            }
-            *field = raw;
-        }
     }
     if commas.next().is_some() {
         return None;
     }
-    let raw = &line[start..];
-    if quotes == 0 {
-        result[N - 1] = raw;
-    } else if raw.first() == Some(&b'"') {
-        if raw.len() < 2 || raw.last() != Some(&b'"') {
-            return None;
-        }
-        let inner = &raw[1..raw.len() - 1];
-        if memchr(b'"', inner).is_some() {
-            return None;
-        }
-        result[N - 1] = inner;
+    result[N - 1] = strip_ends(&line[start..], &mut endpoints);
+    (endpoints as usize == memchr_iter(b'"', line).count()).then_some(result)
+}
+
+#[inline]
+fn strip_ends<'a>(raw: &'a [u8], endpoints: &mut u32) -> &'a [u8] {
+    // As every recognized boundary consumes exactly two distinct quotes,
+    // comparing to the line's total also rejects every internal quote.
+    if let [b'"', content @ .., b'"'] = raw {
+        *endpoints += 2;
+        content
     } else {
-        if memchr(b'"', raw).is_some() {
-            return None;
-        }
-        result[N - 1] = raw;
+        raw
     }
-    Some(result)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn separator_masks(line: &[u8]) -> (u128, u32) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let scan = |index: usize| {
+        // Each caller ensures index..index+32 lies entirely inside line.
+        let bytes = unsafe { _mm256_loadu_si256(line.as_ptr().add(index).cast::<__m256i>()) };
+        let commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, comma)) as u32;
+        let quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, quote)) as u32;
+        (commas, quotes)
+    };
+    let mut offset = 0;
+    let mut commas = 0;
+    let mut quotes = 0;
+    while offset + 32 <= line.len() {
+        let (current, quoted) = scan(offset);
+        commas |= u128::from(current) << offset;
+        quotes += quoted.count_ones();
+        offset += 32;
+    }
+    if offset < line.len() {
+        let tail = line.len() - 32;
+        let overlap = offset - tail;
+        let (current, quoted) = scan(tail);
+        commas |= u128::from(current >> overlap) << offset;
+        quotes += (quoted >> overlap).count_ones();
+    }
+    (commas, quotes)
 }
 
 #[inline]
@@ -175,17 +191,36 @@ pub fn digits(bytes: &[u8]) -> Option<i64> {
         return None;
     }
     let mut value = 0_i64;
-    for &byte in bytes {
-        let digit = byte.wrapping_sub(b'0');
-        if digit > 9 {
-            return None;
+    if bytes.len() <= 18 {
+        for &byte in bytes {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value * 10 + i64::from(digit);
         }
-        value = value.wrapping_mul(10) + i64::from(digit);
-    }
-    if value < 0 {
-        return None;
+    } else {
+        for &byte in bytes {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
+        }
     }
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digits;
+
+    #[test]
+    fn decimal_does_not_wrap() {
+        assert_eq!(digits(b"18446744073709551617"), None);
+        assert_eq!(digits(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(digits(b"000000000000000000001"), Some(1));
+    }
 }
 
 #[inline]
