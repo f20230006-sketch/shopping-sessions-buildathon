@@ -1,7 +1,7 @@
 mod input;
 mod output;
 
-use input::{DAY, WEEK, chunks, digits, fields, lines, maps, timestamp};
+use input::{DAY, WEEK, chunks, digits, fast_timestamp_f1, fields, lines, maps, timestamp};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::fs;
@@ -45,13 +45,21 @@ impl<'a> People<'a> {
         let mut labels = Vec::new();
         let mut parent = Vec::new();
         let mut sizes = Vec::new();
-        for row in chunks(files).into_iter().flat_map(lines) {
-            let Some(pair) = fields::<2>(row) else {
-                continue;
-            };
-            if pair.iter().any(|name| name.is_empty()) {
-                continue;
-            }
+        let raw_pairs: Vec<[Name<'a>; 2]> = chunks(files)
+            .into_par_iter()
+            .flat_map_iter(|chunk| {
+                lines(chunk).filter_map(|row| {
+                    let pair = fields::<2>(row)?;
+                    if pair[0].is_empty() || pair[1].is_empty() {
+                        None
+                    } else {
+                        Some(pair)
+                    }
+                })
+            })
+            .collect();
+
+        for pair in raw_pairs {
             let [a, b] = pair.map(|name| {
                 *ids.entry(name).or_insert_with(|| {
                     let id = labels.len() as u32;
@@ -155,7 +163,7 @@ fn parse_event<'a>(
     if id.is_empty() {
         return None;
     }
-    let ingest = timestamp(ingest)?;
+    let ingest = fast_timestamp_f1(ingest)?;
     let event = (|| {
         if user.is_empty() || product.is_empty() {
             return None;
@@ -221,6 +229,28 @@ fn publish<T, const N: usize>(local: [Vec<T>; N], shared: &[Mutex<Vec<T>>; N]) {
     }
 }
 
+fn collect_earliest_packed<'a>(
+    mut entries: Vec<(u64, i64, Option<Event<'a>>)>,
+    people: &mut [Vec<Event<'a>>; BUCKETS],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_unstable_by_key(|e| (e.0, e.1));
+    let mut last_key = entries[0].0;
+    if let Some(event) = entries[0].2 {
+        people[shard(event.user)].push(event);
+    }
+    for entry in &entries[1..] {
+        if entry.0 != last_key {
+            last_key = entry.0;
+            if let Some(event) = entry.2 {
+                people[shard(event.user)].push(event);
+            }
+        }
+    }
+}
+
 fn collect_earliest<'a, K: Eq + Hash>(
     entries: impl IntoIterator<Item = (K, i64, Option<Event<'a>>)>,
     count: usize,
@@ -274,10 +304,9 @@ fn read_events<'a>(
         .for_each(|(packed, bucket)| {
             let packed = packed.into_inner().unwrap();
             let bucket = bucket.into_inner().unwrap();
-            let packed_count = packed.len();
-            let other_count = bucket.len();
             let mut local = buckets();
-            collect_earliest(packed, packed_count, &mut local);
+            collect_earliest_packed(packed, &mut local);
+            let other_count = bucket.len();
             let other = bucket
                 .into_iter()
                 .map(|event| (event.id, event.ingest, event.event));
@@ -550,17 +579,17 @@ fn run(data: &Path, out: &Path) {
     let products = fs::read(data.join("products.csv")).unwrap();
     let campaigns = fs::read(data.join("campaigns.csv")).unwrap();
     let catalog = Catalog::new(&products, &campaigns);
+    let t_meta = start.elapsed();
     let links = maps(&data.join("links"));
     let people = People::from_links(&links);
+    let t_links = start.elapsed();
     let event_files = maps(&data.join("events"));
     let click_files = maps(&data.join("clicks"));
+    let t_maps = start.elapsed();
     let events = read_events(&event_files, &people, &catalog, &window);
-    eprintln!(
-        "deduplicated events after {:.2}s",
-        start.elapsed().as_secs_f64()
-    );
+    let t_events = start.elapsed();
     let clicks = read_clicks(&click_files, &people, &catalog, &window);
-    eprintln!("parsed clicks after {:.2}s", start.elapsed().as_secs_f64());
+    let t_clicks = start.elapsed();
 
     let user_out = out.join("user_daily");
     let campaign_out = out.join("campaign_daily");
@@ -583,7 +612,17 @@ fn run(data: &Path, out: &Path) {
         totals,
         &catalog.campaigns,
     );
-    eprintln!("wrote output after {:.2}s", start.elapsed().as_secs_f64());
+    let t_total = start.elapsed();
+    eprintln!(
+        "TIMING: meta={:.3}s links={:.3}s mmaps={:.3}s events={:.3}s clicks={:.3}s output={:.3}s TOTAL={:.3}s",
+        t_meta.as_secs_f64(),
+        (t_links - t_meta).as_secs_f64(),
+        (t_maps - t_links).as_secs_f64(),
+        (t_events - t_maps).as_secs_f64(),
+        (t_clicks - t_events).as_secs_f64(),
+        (t_total - t_clicks).as_secs_f64(),
+        t_total.as_secs_f64()
+    );
 }
 
 fn main() {

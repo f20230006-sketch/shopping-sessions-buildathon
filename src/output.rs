@@ -21,7 +21,7 @@ fn write(path: &Path, fields: &[(&str, DataType, bool)], arrays: Vec<ArrayRef>) 
     ));
     let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
     let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::UNCOMPRESSED)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
         .build();
     let mut writer =

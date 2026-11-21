@@ -5,7 +5,7 @@ use std::path::Path;
 
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
-const CHUNK: usize = 8 * 1024 * 1024;
+const CHUNK: usize = 32 * 1024 * 1024;
 
 pub fn maps(directory: &Path) -> Vec<Mmap> {
     fs::read_dir(directory)
@@ -53,6 +53,18 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut result = [b"".as_slice(); N];
     let mut commas = memchr_iter(b',', line);
     let mut start = 0;
+    if memchr(b'"', line).is_none() {
+        for field in &mut result[..N - 1] {
+            let end = commas.next()?;
+            *field = &line[start..end];
+            start = end + 1;
+        }
+        if commas.next().is_some() {
+            return None;
+        }
+        result[N - 1] = &line[start..];
+        return Some(result);
+    }
     for field in &mut result[..N - 1] {
         let end = commas.next()?;
         *field = unquote(&line[start..end])?;
@@ -76,6 +88,35 @@ fn unquote(field: &[u8]) -> Option<&[u8]> {
     } else {
         memchr(b'"', field).is_none().then_some(field)
     }
+}
+
+#[inline]
+pub fn fast_timestamp_f1(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let year = pair(bytes, 0)? * 100 + pair(bytes, 2)?;
+    let month = pair(bytes, 5)?;
+    let date = pair(bytes, 8)?;
+    let hour = pair(bytes, 11)?;
+    let minute = pair(bytes, 14)?;
+    let second = pair(bytes, 17)?;
+    if year == 0 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let year = year - i64::from(month <= 2);
+    let month = if month > 2 { month - 3 } else { month + 9 };
+    let days = year * 365 + year / 4 - year / 100 + year / 400 + (153 * month + 2) / 5 + date
+        - 1
+        - 719_468;
+    Some(days * DAY + (hour * 3600 + minute * 60 + second) * 1000)
 }
 
 pub fn digits(bytes: &[u8]) -> Option<i64> {
