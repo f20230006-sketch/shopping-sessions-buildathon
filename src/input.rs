@@ -53,7 +53,8 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut result = [b"".as_slice(); N];
     let mut commas = memchr_iter(b',', line);
     let mut start = 0;
-    if memchr(b'"', line).is_none() {
+    let mut quotes = memchr_iter(b'"', line).count();
+    if quotes == 0 {
         for field in &mut result[..N - 1] {
             let end = commas.next()?;
             *field = &line[start..end];
@@ -65,16 +66,65 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         result[N - 1] = &line[start..];
         return Some(result);
     }
+    if quotes % 2 != 0 {
+        return None;
+    }
     for field in &mut result[..N - 1] {
         let end = commas.next()?;
-        *field = unquote(&line[start..end])?;
+        let raw = &line[start..end];
         start = end + 1;
+        if quotes == 0 {
+            *field = raw;
+        } else if raw.first() == Some(&b'"') {
+            if raw.len() < 2 || raw.last() != Some(&b'"') {
+                return None;
+            }
+            let inner = &raw[1..raw.len() - 1];
+            if memchr(b'"', inner).is_some() {
+                return None;
+            }
+            quotes -= 2;
+            *field = inner;
+        } else {
+            if memchr(b'"', raw).is_some() {
+                return None;
+            }
+            *field = raw;
+        }
     }
     if commas.next().is_some() {
         return None;
     }
-    result[N - 1] = unquote(&line[start..])?;
+    let raw = &line[start..];
+    if quotes == 0 {
+        result[N - 1] = raw;
+    } else if raw.first() == Some(&b'"') {
+        if raw.len() < 2 || raw.last() != Some(&b'"') {
+            return None;
+        }
+        let inner = &raw[1..raw.len() - 1];
+        if memchr(b'"', inner).is_some() {
+            return None;
+        }
+        result[N - 1] = inner;
+    } else {
+        if memchr(b'"', raw).is_some() {
+            return None;
+        }
+        result[N - 1] = raw;
+    }
     Some(result)
+}
+
+#[inline]
+pub fn link_fields(line: &[u8]) -> Option<[&[u8]; 2]> {
+    let comma = memchr(b',', line)?;
+    let a = unquote(&line[..comma])?;
+    let b = unquote(&line[comma + 1..])?;
+    if a.is_empty() || b.is_empty() || memchr(b',', &line[comma + 1..]).is_some() {
+        return None;
+    }
+    Some([a, b])
 }
 
 #[inline]
@@ -119,6 +169,7 @@ pub fn fast_timestamp_f1(bytes: &[u8]) -> Option<i64> {
     Some(days * DAY + (hour * 3600 + minute * 60 + second) * 1000)
 }
 
+#[inline]
 pub fn digits(bytes: &[u8]) -> Option<i64> {
     if bytes.is_empty() {
         return None;
@@ -129,7 +180,10 @@ pub fn digits(bytes: &[u8]) -> Option<i64> {
         if digit > 9 {
             return None;
         }
-        value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
+        value = value.wrapping_mul(10) + i64::from(digit);
+    }
+    if value < 0 {
+        return None;
     }
     Some(value)
 }

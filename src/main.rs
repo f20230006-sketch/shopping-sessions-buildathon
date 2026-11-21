@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-const BUCKETS: usize = 128;
+const BUCKETS: usize = 16;
 const EVENT_BUCKETS: usize = 256;
 
 #[inline]
@@ -28,8 +28,13 @@ struct People<'a> {
 }
 
 impl<'a> People<'a> {
+    #[inline]
     fn name(&self, name: Name<'a>) -> Name<'a> {
-        self.names.get(name).copied().unwrap_or(name)
+        if self.names.is_empty() {
+            name
+        } else {
+            self.names.get(name).copied().unwrap_or(name)
+        }
     }
 
     fn from_links(files: &'a [memmap2::Mmap]) -> Self {
@@ -41,21 +46,14 @@ impl<'a> People<'a> {
             id
         }
 
-        let mut ids = FxHashMap::default();
-        let mut labels = Vec::new();
-        let mut parent = Vec::new();
-        let mut sizes = Vec::new();
+        let mut ids = FxHashMap::with_capacity_and_hasher(1_000_000, Default::default());
+        let mut labels = Vec::with_capacity(1_000_000);
+        let mut parent = Vec::with_capacity(1_000_000);
+        let mut sizes = Vec::with_capacity(1_000_000);
         let raw_pairs: Vec<[Name<'a>; 2]> = chunks(files)
             .into_par_iter()
             .flat_map_iter(|chunk| {
-                lines(chunk).filter_map(|row| {
-                    let pair = fields::<2>(row)?;
-                    if pair[0].is_empty() || pair[1].is_empty() {
-                        None
-                    } else {
-                        Some(pair)
-                    }
-                })
+                lines(chunk).filter_map(input::link_fields)
             })
             .collect();
 
@@ -155,7 +153,6 @@ struct Click<'a> {
 
 fn parse_event<'a>(
     row: &'a [u8],
-    people: &People<'a>,
     catalog: &Catalog,
     window: &Window,
 ) -> Option<StagedEvent<'a>> {
@@ -187,7 +184,7 @@ fn parse_event<'a>(
             _ => return None,
         };
         Some(Event {
-            user: people.name(user),
+            user,
             ts,
             price,
             category,
@@ -231,6 +228,7 @@ fn publish<T, const N: usize>(local: [Vec<T>; N], shared: &[Mutex<Vec<T>>; N]) {
 
 fn collect_earliest_packed<'a>(
     mut entries: Vec<(u64, i64, Option<Event<'a>>)>,
+    people_resolver: &People<'a>,
     people: &mut [Vec<Event<'a>>; BUCKETS],
 ) {
     if entries.is_empty() {
@@ -238,13 +236,15 @@ fn collect_earliest_packed<'a>(
     }
     entries.sort_unstable_by_key(|e| (e.0, e.1));
     let mut last_key = entries[0].0;
-    if let Some(event) = entries[0].2 {
+    if let Some(mut event) = entries[0].2 {
+        event.user = people_resolver.name(event.user);
         people[shard(event.user)].push(event);
     }
     for entry in &entries[1..] {
         if entry.0 != last_key {
             last_key = entry.0;
-            if let Some(event) = entry.2 {
+            if let Some(mut event) = entry.2 {
+                event.user = people_resolver.name(event.user);
                 people[shard(event.user)].push(event);
             }
         }
@@ -254,6 +254,7 @@ fn collect_earliest_packed<'a>(
 fn collect_earliest<'a, K: Eq + Hash>(
     entries: impl IntoIterator<Item = (K, i64, Option<Event<'a>>)>,
     count: usize,
+    people_resolver: &People<'a>,
     people: &mut [Vec<Event<'a>>; BUCKETS],
 ) {
     let mut earliest = FxHashMap::with_capacity_and_hasher(count, Default::default());
@@ -263,7 +264,8 @@ fn collect_earliest<'a, K: Eq + Hash>(
             *kept = (ingest, event);
         }
     }
-    for event in earliest.into_values().filter_map(|(_, event)| event) {
+    for mut event in earliest.into_values().filter_map(|(_, event)| event) {
+        event.user = people_resolver.name(event.user);
         people[shard(event.user)].push(event);
     }
 }
@@ -274,12 +276,13 @@ fn read_events<'a>(
     catalog: &Catalog,
     window: &Window,
 ) -> Vec<Vec<Event<'a>>> {
+    let t0 = Instant::now();
     let inline: [_; EVENT_BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
     let shared: [_; EVENT_BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
     chunks(files).into_par_iter().for_each(|chunk| {
         let mut packed = buckets();
         let mut local = buckets();
-        for event in lines(chunk).filter_map(|row| parse_event(row, people, catalog, window)) {
+        for event in lines(chunk).filter_map(|row| parse_event(row, catalog, window)) {
             if let [prefix, suffix @ ..] = event.id
                 && let Ok(suffix) = <[u8; 8]>::try_from(suffix)
             {
@@ -295,7 +298,7 @@ fn read_events<'a>(
         publish(packed, &inline);
         publish(local, &shared);
     });
-    eprintln!("parsed events");
+    let t_parse = t0.elapsed();
 
     let people_buckets: [_; BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
     inline
@@ -305,14 +308,16 @@ fn read_events<'a>(
             let packed = packed.into_inner().unwrap();
             let bucket = bucket.into_inner().unwrap();
             let mut local = buckets();
-            collect_earliest_packed(packed, &mut local);
+            collect_earliest_packed(packed, people, &mut local);
             let other_count = bucket.len();
             let other = bucket
                 .into_iter()
                 .map(|event| (event.id, event.ingest, event.event));
-            collect_earliest(other, other_count, &mut local);
+            collect_earliest(other, other_count, people, &mut local);
             publish(local, &people_buckets);
         });
+    let t_dedup = t0.elapsed() - t_parse;
+    eprintln!("events breakdown: parse={:.3}s dedup={:.3}s", t_parse.as_secs_f64(), t_dedup.as_secs_f64());
     people_buckets
         .into_iter()
         .map(|part| part.into_inner().unwrap())

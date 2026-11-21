@@ -5,6 +5,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,8 +25,10 @@ fn write(path: &Path, fields: &[(&str, DataType, bool)], arrays: Vec<ArrayRef>) 
         .set_compression(Compression::UNCOMPRESSED)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
         .build();
+    let file = File::create(path).unwrap();
+    let writer = BufWriter::with_capacity(256 * 1024, file);
     let mut writer =
-        ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(properties)).unwrap();
+        ArrowWriter::try_new(writer, schema, Some(properties)).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 }
