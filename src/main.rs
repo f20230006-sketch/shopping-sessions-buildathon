@@ -2,6 +2,7 @@ mod input;
 mod output;
 
 use input::{DAY, WEEK, chunks, digits, fast_timestamp_f1, fields, lines, maps, timestamp};
+use memchr::memchr;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::fs;
@@ -227,7 +228,9 @@ fn publish<T, const N: usize>(local: [Vec<T>; N], shared: &[Mutex<Vec<T>>; N]) {
 }
 
 fn collect_earliest_packed<'a>(
-    mut entries: Vec<(u64, i64, Option<Event<'a>>)>,
+    mut entries: Vec<PackedEvent>,
+    sources: &[Name<'a>],
+    start: i64,
     people_resolver: &People<'a>,
     people: &mut [Vec<Event<'a>>; BUCKETS],
 ) {
@@ -240,7 +243,8 @@ fn collect_earliest_packed<'a>(
     let mut slots = vec![0_u32; capacity];
     let shift = u64::BITS - capacity.trailing_zeros();
     for index in 0..entries.len() {
-        let (key, ingest, _) = entries[index];
+        let key = entries[index].key;
+        let ingest = entries[index].ingest;
         let hash = key.rotate_left(23).wrapping_mul(0xd6e8_feb8_6659_fd93);
         let mut slot = (hash >> shift) as usize;
         loop {
@@ -250,19 +254,19 @@ fn collect_earliest_packed<'a>(
                 break;
             }
             let previous = previous as usize - 1;
-            if entries[previous].0 == key {
-                if ingest < entries[previous].1 {
-                    entries[previous].2 = None;
+            if entries[previous].key == key {
+                if ingest < entries[previous].ingest {
+                    entries[previous].user = 0;
                     slots[slot] = (index + 1) as u32;
                 } else {
-                    entries[index].2 = None;
+                    entries[index].user = 0;
                 }
                 break;
             }
             slot = (slot + 1) & (capacity - 1);
         }
     }
-    for mut event in entries.into_iter().filter_map(|(_, _, event)| event) {
+    for mut event in entries.into_iter().filter_map(|event| event.decode(sources, start)) {
         event.user = people_resolver.name(event.user);
         people[shard(event.user)].push(event);
     }
@@ -287,11 +291,63 @@ fn collect_earliest<'a, K: Eq + Hash>(
     }
 }
 
-type PackedEvent<'a> = (u64, i64, Option<Event<'a>>);
+const SOURCE_SHIFT: u32 = 48;
+const POSITION_SHIFT: u32 = 22;
+const POSITION_MASK: u64 = (1 << (SOURCE_SHIFT - POSITION_SHIFT)) - 1;
+const LENGTH_MASK: u64 = (1 << POSITION_SHIFT) - 1;
+
+struct PackedEvent {
+    key: u64,
+    ingest: i64,
+    user: u64,
+    payload: u64,
+}
+
+impl PackedEvent {
+    fn encode(key: u64, staged: StagedEvent<'_>, chunk: &[u8], index: usize, start: i64) -> Self {
+        let (user, payload) = staged.event.map_or((0, 0), |event| {
+            let offset = (event.ts - start) as u64;
+            let payload = (offset << 33) | (u64::from(event.price) << 9) | u64::from(event.category);
+            // The parser returns the user's bytes as a subslice of this chunk.
+            let position = event.user.as_ptr() as usize - chunk.as_ptr() as usize;
+            let len = event.user.len() as u64;
+            let size = if len <= LENGTH_MASK { len } else { 0 };
+            let user = ((index as u64) << SOURCE_SHIFT)
+                | ((position as u64) << POSITION_SHIFT)
+                | size;
+            (user, payload)
+        });
+        Self { key, ingest: staged.ingest, user, payload }
+    }
+
+    fn decode<'a>(self, sources: &[Name<'a>], start: i64) -> Option<Event<'a>> {
+        if self.user == 0 {
+            return None;
+        }
+        let source = sources[(self.user >> SOURCE_SHIFT) as usize];
+        let position = ((self.user >> POSITION_SHIFT) & POSITION_MASK) as usize;
+        let length = (self.user & LENGTH_MASK) as usize;
+        let length = if length == 0 {
+            // For an unusually long user ID, recover its already validated
+            // boundary instead of truncating the length in the handle.
+            let quoted = source[position - 1] == b'"';
+            memchr(b',', &source[position..]).unwrap() - usize::from(quoted)
+        } else {
+            length
+        };
+        Some(Event {
+            user: &source[position..position + length],
+            ts: start + (self.payload >> 33) as i64,
+            price: ((self.payload >> 9) & ((1 << 24) - 1)) as u32,
+            category: (self.payload & 511) as u32,
+        })
+    }
+}
 
 struct EventShards<'a> {
-    packed: [Mutex<Vec<PackedEvent<'a>>>; EVENT_BUCKETS],
+    packed: [Mutex<Vec<PackedEvent>>; EVENT_BUCKETS],
     other: [Mutex<Vec<StagedEvent<'a>>>; EVENT_BUCKETS],
+    sources: Vec<Name<'a>>,
 }
 
 fn stage_events<'a>(
@@ -302,19 +358,25 @@ fn stage_events<'a>(
     let stages = EventShards {
         packed: std::array::from_fn(|_| Mutex::new(Vec::new())),
         other: std::array::from_fn(|_| Mutex::new(Vec::new())),
+        sources: chunks(files),
     };
-    chunks(files).into_par_iter().for_each(|chunk| {
+    let can_pack = (0..=(1_i64 << 31)).contains(&(window.end - window.start))
+        && catalog.categories.len() <= 512
+        && stages.sources.len() <= (1 << (64 - SOURCE_SHIFT))
+        && stages.sources.iter().all(|chunk| chunk.len() as u64 <= POSITION_MASK + 1);
+    stages.sources.par_iter().enumerate().for_each(|(index, &chunk)| {
         let mut packed = buckets();
         let mut local = buckets();
         for event in lines(chunk).filter_map(|row| parse_event(row, catalog, window)) {
-            if let [prefix, suffix @ ..] = event.id
+            if can_pack
+                && let [prefix, suffix @ ..] = event.id
                 && let Ok(suffix) = <[u8; 8]>::try_from(suffix)
             {
                 let key = u64::from_le_bytes(suffix);
                 // The shard and suffix recover the prefix exactly, even if the
                 // bytes aren't ASCII. The 256-way shard acts as the ninth byte.
                 let bucket = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as u8 ^ prefix;
-                packed[bucket as usize].push((key, event.ingest, event.event));
+                packed[bucket as usize].push(PackedEvent::encode(key, event, chunk, index, window.start));
             } else {
                 local[shard(event.id)].push(event);
             }
@@ -325,8 +387,9 @@ fn stage_events<'a>(
     stages
 }
 
-fn resolve_events<'a>(stages: EventShards<'a>, people: &People<'a>) -> Vec<Vec<Event<'a>>> {
+fn resolve_events<'a>(stages: EventShards<'a>, people: &People<'a>, start: i64) -> Vec<Vec<Event<'a>>> {
     let people_buckets: [_; BUCKETS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
+    let sources = &stages.sources;
     stages.packed
         .into_par_iter()
         .zip(stages.other)
@@ -334,7 +397,7 @@ fn resolve_events<'a>(stages: EventShards<'a>, people: &People<'a>) -> Vec<Vec<E
             let packed = packed.into_inner().unwrap();
             let bucket = bucket.into_inner().unwrap();
             let mut local = buckets();
-            collect_earliest_packed(packed, people, &mut local);
+            collect_earliest_packed(packed, sources, start, people, &mut local);
             let other_count = bucket.len();
             let other = bucket
                 .into_iter()
@@ -619,7 +682,7 @@ fn run(data: &Path, out: &Path) {
     );
     let t_staged = start.elapsed();
     let (events, clicks) = rayon::join(
-        || resolve_events(staged, &people),
+        || resolve_events(staged, &people, window.start),
         || read_clicks(&click_files, &people, &catalog, &window),
     );
     let t_resolved = start.elapsed();
